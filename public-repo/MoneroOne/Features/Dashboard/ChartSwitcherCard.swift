@@ -127,7 +127,13 @@ struct ChartSwitcherCard: View {
         .background(Color(.secondarySystemGroupedBackground))
         .cornerRadius(16)
         .task {
+            // Set loading synchronously before async work to avoid blank state
+            if priceService.chartDataCache[selectedTimeRange.apiRange] == nil {
+                priceService.isLoadingChart = true
+            }
             await priceService.fetchChartData(range: selectedTimeRange.apiRange)
+            // Calculate domain after initial load (onChange doesn't fire on initial value)
+            updateCachedYDomain()
         }
         .onAppear {
             portfolioData = priceService.chartData.map { point in
@@ -138,7 +144,11 @@ struct ChartSwitcherCard: View {
             selectedDate = nil
             selectedPricePoint = nil
             selectedPortfolioPoint = nil
-            priceService.chartData = []
+            priceService.currentChartRange = newValue.apiRange
+            // Only show loading if not cached
+            if priceService.chartDataCache[newValue.apiRange] == nil {
+                priceService.isLoadingChart = true
+            }
             Task {
                 await priceService.fetchChartData(range: newValue.apiRange)
             }
@@ -153,6 +163,10 @@ struct ChartSwitcherCard: View {
             portfolioData = priceService.chartData.map { point in
                 PortfolioPoint(timestamp: point.timestamp, value: balanceDouble * point.price)
             }
+            updateCachedYDomain()
+        }
+        .onChange(of: priceService.currentChartRange) { _ in
+            // Recalculate domain when range changes (even if count is same)
             updateCachedYDomain()
         }
         .onChange(of: selectedDate) { newDate in
@@ -275,7 +289,7 @@ struct ChartSwitcherCard: View {
                                 endPoint: .bottom
                             )
                         )
-                        .interpolationMethod(.catmullRom)
+                        .interpolationMethod(.monotone)
 
                         LineMark(
                             x: .value("Time", point.timestamp),
@@ -283,7 +297,7 @@ struct ChartSwitcherCard: View {
                         )
                         .foregroundStyle(Color.orange)
                         .lineStyle(StrokeStyle(lineWidth: 2))
-                        .interpolationMethod(.catmullRom)
+                        .interpolationMethod(.monotone)
                     }
 
                     if let selectedPoint = selectedPricePoint {
@@ -312,7 +326,7 @@ struct ChartSwitcherCard: View {
                                 endPoint: .bottom
                             )
                         )
-                        .interpolationMethod(.catmullRom)
+                        .interpolationMethod(.monotone)
 
                         LineMark(
                             x: .value("Time", point.timestamp),
@@ -320,7 +334,7 @@ struct ChartSwitcherCard: View {
                         )
                         .foregroundStyle(Color.orange)
                         .lineStyle(StrokeStyle(lineWidth: 2))
-                        .interpolationMethod(.catmullRom)
+                        .interpolationMethod(.monotone)
                     }
 
                     if let selectedPoint = selectedPortfolioPoint {
