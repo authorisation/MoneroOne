@@ -78,6 +78,8 @@ struct TransactionListView: View {
                     Image(systemName: filterType == .all ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
                         .foregroundColor(filterType == .all ? .primary : .orange)
                 }
+                .accessibilityLabel("Filter transactions")
+                .accessibilityHint("Currently showing \(filterType.rawValue.lowercased()) transactions")
             }
         }
     }
@@ -152,16 +154,24 @@ struct TransactionRow: View {
                     .foregroundColor(transaction.type == .incoming ? .green : .primary)
 
                 HStack(spacing: 4) {
-                    Circle()
-                        .fill(transaction.displayStatusColor)
-                        .frame(width: 6, height: 6)
-                    Text(transaction.displayStatusText)
-                        .font(.caption2)
-                        .foregroundColor(transaction.displayStatusColor)
+                    if transaction.isStatusLoading {
+                        ProgressView()
+                            .scaleEffect(0.5)
+                            .frame(width: 6, height: 6)
+                    } else {
+                        Circle()
+                            .fill(transaction.displayStatusColor)
+                            .frame(width: 6, height: 6)
+                        Text(transaction.displayStatusText)
+                            .font(.caption2)
+                            .foregroundColor(transaction.displayStatusColor)
+                    }
                 }
             }
         }
         .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(transaction.type == .incoming ? "Received" : "Sent") \(XMRFormatter.format(transaction.amount)) XMR, \(formattedDate), \(transaction.displayStatusText)")
     }
 
     private var formattedDate: String {

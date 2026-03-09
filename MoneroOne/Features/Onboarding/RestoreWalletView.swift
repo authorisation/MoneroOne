@@ -101,11 +101,15 @@ struct RestoreWalletView: View {
                 .cornerRadius(12)
                 .autocapitalization(.none)
                 .autocorrectionDisabled()
+                .accessibilityLabel("Seed phrase input")
+                .accessibilityHint("Enter your seed phrase words separated by spaces")
+                .accessibilityIdentifier("restore.seedInput")
 
             if let error = errorMessage {
                 Text(error)
                     .foregroundColor(.red)
                     .font(.caption)
+                    .accessibilityLabel(error)
             }
 
             Text("Separate words with spaces")
@@ -124,6 +128,9 @@ struct RestoreWalletView: View {
                     .cornerRadius(14)
             }
             .disabled(!isValidSeedCount)
+            .accessibilityLabel("Continue")
+            .accessibilityHint(isValidSeedCount ? "Double tap to proceed with your seed phrase" : "Enter a valid seed phrase to continue")
+            .accessibilityIdentifier("restore.continueButton")
 
             Spacer()
         }
@@ -162,6 +169,8 @@ struct RestoreWalletView: View {
                             )
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("4 digit PIN. \(selectedPINLength == 4 ? "Selected" : "Not selected")")
+                    .accessibilityHint("Double tap to use a 4 digit PIN")
 
                     // 6 digits option (recommended)
                     Button {
@@ -192,6 +201,8 @@ struct RestoreWalletView: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("6 digit PIN, recommended. \(selectedPINLength == 6 ? "Selected" : "Not selected")")
+                    .accessibilityHint("Double tap to use a 6 digit PIN")
                 }
                 .padding(.horizontal, 20)
             }
@@ -203,6 +214,7 @@ struct RestoreWalletView: View {
                 label: "Enter PIN",
                 field: PINField.pin,
                 focusedField: $focusedField,
+                accessibilityID: "restore.pinEntry",
                 onComplete: {
                     focusedField = .confirmPin
                 }
@@ -214,6 +226,7 @@ struct RestoreWalletView: View {
                 label: "Confirm PIN",
                 field: PINField.confirmPin,
                 focusedField: $focusedField,
+                accessibilityID: "restore.confirmPinEntry",
                 onComplete: {
                     if canProceed {
                         // Save the selected PIN length preference
@@ -227,6 +240,8 @@ struct RestoreWalletView: View {
                 Text("PINs don't match")
                     .foregroundColor(.red)
                     .font(.caption)
+                    .accessibilityLabel("PINs don't match")
+                    .accessibilityIdentifier("restore.pinMismatchError")
             }
 
             Button {
@@ -246,6 +261,9 @@ struct RestoreWalletView: View {
             }
             .glassButtonStyle()
             .disabled(!canProceed)
+            .accessibilityLabel("Restore Wallet")
+            .accessibilityHint(canProceed ? "Double tap to restore your wallet" : "Enter and confirm your PIN to continue")
+            .accessibilityIdentifier("restore.pin.continueButton")
             .padding(.horizontal)
 
             Spacer()
@@ -263,9 +281,11 @@ struct RestoreWalletView: View {
             Image(systemName: biometricIcon)
                 .font(.system(size: 80))
                 .foregroundColor(.orange)
+                .accessibilityHidden(true)
 
             Text("Enable \(biometricName)?")
                 .font(.title2.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
 
             Text("Unlock your wallet quickly and securely with \(biometricName) instead of entering your PIN.")
                 .font(.subheadline)
@@ -288,6 +308,8 @@ struct RestoreWalletView: View {
                     .padding(.vertical, 16)
                 }
                 .glassButtonStyle()
+                .accessibilityLabel("Enable \(biometricName)")
+                .accessibilityHint("Double tap to enable \(biometricName) for quick unlock")
 
                 Button {
                     enableBiometrics = false
@@ -299,6 +321,8 @@ struct RestoreWalletView: View {
                         .foregroundColor(.secondary)
                         .padding(.vertical, 12)
                 }
+                .accessibilityLabel("Skip for Now")
+                .accessibilityHint("Double tap to skip biometric setup")
             }
             .padding(.horizontal)
 
@@ -310,9 +334,11 @@ struct RestoreWalletView: View {
         VStack(spacing: 24) {
             Text("Restoring your wallet...")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
 
             ProgressView()
                 .scaleEffect(1.5)
+                .accessibilityLabel("Restoring wallet in progress")
 
             Text("This may take a moment")
                 .font(.subheadline)
@@ -417,6 +443,8 @@ struct RestoreWalletView: View {
                 .padding(.horizontal)
 
             Toggle("Use wallet creation date", isOn: $useCreationDate)
+                .accessibilityLabel("Use wallet creation date")
+                .accessibilityHint("Toggle to specify when the wallet was created for faster scanning")
                 .padding(.horizontal)
 
             if useCreationDate {
@@ -445,6 +473,8 @@ struct RestoreWalletView: View {
                     .foregroundColor(.white)
                     .cornerRadius(14)
             }
+            .accessibilityLabel("Continue")
+            .accessibilityHint("Double tap to proceed to PIN setup")
             .padding(.horizontal)
 
             Spacer()
@@ -477,13 +507,14 @@ struct RestoreWalletView: View {
                     restoreDate = useCreationDate ? walletCreationDate : nil
                 }
                 try walletManager.restoreWallet(mnemonic: seedWords, pin: pin, restoreDate: restoreDate)
+                KeychainStorage().savePinLength(selectedPINLength)
 
                 // Enable biometrics if user opted in
                 if enableBiometrics {
                     try walletManager.enableBiometricUnlock(pin: pin)
                 }
 
-                try walletManager.unlock(pin: pin)
+                try await walletManager.unlock(pin: pin)
             } catch {
                 await MainActor.run {
                     errorMessage = error.localizedDescription

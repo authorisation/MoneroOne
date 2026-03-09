@@ -21,6 +21,16 @@ struct MoneroOneApp: App {
     }
 
     init() {
+        #if DEBUG
+        // UI test state reset — clear all persisted data for a clean slate
+        if CommandLine.arguments.contains("--uitesting") && CommandLine.arguments.contains("--reset-state") {
+            if let bundleId = Bundle.main.bundleIdentifier {
+                UserDefaults.standard.removePersistentDomain(forName: bundleId)
+            }
+            KeychainStorage().deleteAll()
+        }
+        #endif
+
         // Migrate keychain items to new accessibility level (fixes wallet loss after device lock)
         KeychainStorage().migrateKeychainAccessibilityIfNeeded()
 
@@ -29,7 +39,11 @@ struct MoneroOneApp: App {
             forTaskWithIdentifier: Self.priceCheckTaskId,
             using: nil
         ) { task in
-            Self.handlePriceCheck(task: task as! BGAppRefreshTask)
+            guard let refreshTask = task as? BGAppRefreshTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            Self.handlePriceCheck(task: refreshTask)
         }
     }
 
@@ -41,7 +55,7 @@ struct MoneroOneApp: App {
                 .environmentObject(priceAlertService)
                 .preferredColorScheme(colorScheme)
                 .onAppear {
-                    BackgroundSyncManager.shared.configure(walletManager: walletManager)
+                    TrustedLocationSyncManager.shared.configure(walletManager: walletManager)
                     priceService.priceAlertService = priceAlertService
                     schedulePriceCheck()
                 }
@@ -99,7 +113,7 @@ struct MoneroOneApp: App {
         do {
             try BGTaskScheduler.shared.submit(request)
         } catch {
-            print("Failed to schedule price check: \(error)")
+            logger.error("Failed to schedule price check: \(error.localizedDescription)")
         }
     }
 

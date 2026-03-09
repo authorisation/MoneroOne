@@ -23,6 +23,8 @@ class PriceService: ObservableObject {
     @Published var isLoading = false
     @Published var error: String?
     @Published var chartDataCache: [String: [PriceDataPoint]] = [:]
+    private var chartDataTimestamps: [String: Date] = [:]
+    private let chartCacheTTL: TimeInterval = 300 // 5 minutes
     @Published var currentChartRange: String = "7D"
     @Published var isLoadingChart = false
     @Published var chartSmoothingMode: ChartSmoothingMode = .emaSmoothed
@@ -33,7 +35,7 @@ class PriceService: ObservableObject {
     @Published var usdToSelectedRate: Double = 1.0
 
     private var refreshTimer: Timer?
-    private let refreshInterval: TimeInterval = 60 // 1 minute
+    private let refreshInterval: TimeInterval = 300 // 5 minutes
     private var priceFetchTask: Task<Void, Never>?
     private var currencyChangeDebounceTask: Task<Void, Never>?
 
@@ -160,7 +162,6 @@ class PriceService: ObservableObject {
             // a newer task is handling the fetch
             guard !Task.isCancelled else { return }
             self.error = "Price unavailable"
-            print("Price fetch error after retries: \(error)")
         }
 
         // Don't update loading state if this task was cancelled
@@ -168,13 +169,9 @@ class PriceService: ObservableObject {
         isLoading = false
     }
 
-    /// Performs the actual price fetch - called by fetchWithRetry
+    /// Performs the actual price fetch via monero.one price API
     private func performPriceFetch() async throws {
-        // Fetch both selected currency and USD (for chart conversion)
-        let currencies = selectedCurrency == "usd" ? "usd" : "\(selectedCurrency),usd"
-        let urlString = "https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_currencies=\(currencies)&include_24hr_change=true"
-
-        guard let url = URL(string: urlString) else {
+        guard let url = URL(string: "https://monero.one/api/v1/price") else {
             throw URLError(.badURL)
         }
 
@@ -185,42 +182,52 @@ class PriceService: ObservableObject {
             throw URLError(.badServerResponse)
         }
 
-        let result = try JSONDecoder().decode(CoinGeckoResponse.self, from: data)
+        let result = try JSONDecoder().decode(PriceResponse.self, from: data)
 
-        // Check if task was cancelled before updating price
-        // This prevents stale responses from overwriting newer currency selections
         guard !Task.isCancelled else { return }
 
-        if let moneroData = result.monero {
-            xmrPrice = moneroData[selectedCurrency]
-            priceChange24h = moneroData["\(selectedCurrency)_24h_change"]
-            lastUpdated = Date()
-
-            // Calculate USD to selected currency conversion rate for chart data
-            if selectedCurrency == "usd" {
-                usdToSelectedRate = 1.0
-            } else if let selectedPrice = moneroData[selectedCurrency],
-                      let usdPrice = moneroData["usd"],
-                      usdPrice > 0 {
-                // Rate = selectedCurrency / USD (e.g., GBP/USD)
-                usdToSelectedRate = selectedPrice / usdPrice
-            }
-
-            // Check price alerts
-            if let price = xmrPrice, let alertService = priceAlertService {
-                let triggered = alertService.checkAlerts(
-                    currentPrice: price,
-                    currency: selectedCurrency
-                )
-                for alert in triggered {
-                    PriceAlertNotificationManager.shared.sendAlert(alert, currentPrice: price)
-                }
-            }
-
-            // Save price data for widget
-            savePriceWidgetData()
-        } else {
+        guard let quote = result.quotes[selectedCurrency] else {
             throw URLError(.cannotParseResponse)
+        }
+
+        xmrPrice = quote.price
+        priceChange24h = quote.change24h
+        lastUpdated = Date()
+
+        // Calculate USD to selected currency conversion rate for chart data
+        if selectedCurrency == "usd" {
+            usdToSelectedRate = 1.0
+        } else if let usdQuote = result.quotes["usd"],
+                  usdQuote.price > 0 {
+            usdToSelectedRate = quote.price / usdQuote.price
+        }
+
+        // Check price alerts
+        if let price = xmrPrice, let alertService = priceAlertService {
+            let triggered = alertService.checkAlerts(
+                currentPrice: price,
+                currency: selectedCurrency
+            )
+            for alert in triggered {
+                PriceAlertNotificationManager.shared.sendAlert(alert, currentPrice: price)
+            }
+        }
+
+        updateCachedChartEndpoints()
+        savePriceWidgetData()
+    }
+
+    /// Replace the last data point in each cached chart range with the current live price.
+    /// This keeps the chart tip pinned to the real price between full chart refreshes.
+    private func updateCachedChartEndpoints() {
+        guard let livePrice = xmrPrice, usdToSelectedRate > 0 else { return }
+        let liveUSD = livePrice / usdToSelectedRate
+        let now = Date()
+
+        for key in chartDataCache.keys {
+            guard var points = chartDataCache[key], !points.isEmpty else { continue }
+            points[points.count - 1] = PriceDataPoint(timestamp: now, price: liveUSD)
+            chartDataCache[key] = points
         }
     }
 
@@ -316,31 +323,29 @@ class PriceService: ObservableObject {
         result.reserveCapacity(data.count)
         result.append(data[0])
 
-        // Smooth all points except the last one
-        for i in 1..<(data.count - 1) {
+        for i in 1..<data.count {
             let smoothedPrice = alpha * data[i].price + (1 - alpha) * result[i - 1].price
             result.append(PriceDataPoint(timestamp: data[i].timestamp, price: smoothedPrice))
         }
 
-        // Keep last point unchanged so chart endpoint matches current price
-        result.append(data[data.count - 1])
-
         return result
     }
 
-    /// Fetch chart data using CoinMarketCap ranges: "1D", "7D", "1M", "1Y", "All"
-    func fetchChartData(range: String = "7D") async {
+    /// Fetch chart data for ranges: "1D", "7D", "1M", "1Y", "All"
+    func fetchChartData(range: String = "7D", force: Bool = false) async {
         currentChartRange = range
 
-        // Return cached data if available
-        if chartDataCache[range] != nil {
+        // Return cached data if available and not expired
+        if !force, let cached = chartDataCache[range], !cached.isEmpty,
+           let timestamp = chartDataTimestamps[range],
+           Date().timeIntervalSince(timestamp) < chartCacheTTL {
             isLoadingChart = false
             return
         }
 
         isLoadingChart = true
 
-        // Map range to interval (matching CMC website)
+        // Map range to interval
         let interval: String = {
             switch range {
             case "1D": return "5m"
@@ -364,8 +369,7 @@ class PriceService: ObservableObject {
             }
         }()
 
-        // CoinMarketCap API - id=328 is Monero, convertId=2781 is USD
-        let urlString = "https://api.coinmarketcap.com/data-api/v3.3/cryptocurrency/detail/chart?id=328&interval=\(interval)&convertId=2781&range=\(range)"
+        let urlString = "https://monero.one/api/v1/chart?range=\(range)"
 
         guard let url = URL(string: urlString) else {
             isLoadingChart = false
@@ -374,11 +378,6 @@ class PriceService: ObservableObject {
 
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        // Required headers for CMC API
-        request.setValue("application/json", forHTTPHeaderField: "accept")
-        request.setValue("https://coinmarketcap.com", forHTTPHeaderField: "origin")
-        request.setValue("web", forHTTPHeaderField: "platform")
-        request.setValue("https://coinmarketcap.com/", forHTTPHeaderField: "referer")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -391,7 +390,7 @@ class PriceService: ObservableObject {
 
             let result = try JSONDecoder().decode(CMCChartResponse.self, from: data)
 
-            // Convert CMC data to PriceDataPoint array
+            // Convert chart data to PriceDataPoint array
             var allPoints = result.data.points.compactMap { point -> PriceDataPoint? in
                 guard let timestamp = Double(point.s),
                       let price = point.v.first else { return nil }
@@ -424,8 +423,16 @@ class PriceService: ObservableObject {
                 newChartData = applyEMA(newChartData, alpha: 0.3)
             }
 
+            // Append current live price so the chart ends at "now" instead of the
+            // last API interval (which can be hours/days old for longer ranges).
+            if !newChartData.isEmpty, let livePrice = xmrPrice, usdToSelectedRate > 0 {
+                let liveUSD = livePrice / usdToSelectedRate
+                newChartData.append(PriceDataPoint(timestamp: Date(), price: liveUSD))
+            }
+
             if !newChartData.isEmpty {
                 chartDataCache[range] = newChartData
+                chartDataTimestamps[range] = Date()
                 // Save updated chart data for widget
                 savePriceWidgetData()
             }
@@ -440,6 +447,7 @@ class PriceService: ObservableObject {
     func setChartSmoothingMode(_ mode: ChartSmoothingMode) {
         chartSmoothingMode = mode
         chartDataCache.removeAll()  // Clear cache to regenerate with new mode
+        chartDataTimestamps.removeAll()
         Task {
             let ranges = ["7D", "1D", "1M", "1Y", "All"]
             for range in ranges {
@@ -450,7 +458,7 @@ class PriceService: ObservableObject {
 
     var priceRange: (min: Double, max: Double)? {
         guard !chartData.isEmpty else { return nil }
-        // Apply currency conversion (chart data is always in USD from CMC API)
+        // Apply currency conversion (chart data is always in USD)
         let prices = chartData.map { $0.price * usdToSelectedRate }
         return (prices.min() ?? 0, prices.max() ?? 0)
     }
@@ -502,17 +510,19 @@ class PriceService: ObservableObject {
     }
 }
 
-// MARK: - CoinGecko Response
+// MARK: - Price API Response
 
-struct CoinGeckoResponse: Codable {
-    let monero: [String: Double]?
+struct PriceResponse: Codable {
+    let quotes: [String: PriceQuote]
+    let timestamp: Double
 }
 
-struct MarketChartResponse: Codable {
-    let prices: [[Double]]
+struct PriceQuote: Codable {
+    let price: Double
+    let change24h: Double
 }
 
-// MARK: - CoinMarketCap Response
+// MARK: - Chart API Response
 
 struct CMCChartResponse: Codable {
     let data: CMCChartData

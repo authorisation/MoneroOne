@@ -21,6 +21,9 @@ struct SeedPhraseView: View {
                 .padding(.vertical, 6)
                 .background(Color(.tertiarySystemBackground))
                 .cornerRadius(8)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Word \(index + 1): \(word)")
+                .accessibilityIdentifier("seedPhrase.word.\(index)")
             }
         }
     }

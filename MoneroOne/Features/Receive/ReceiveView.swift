@@ -36,6 +36,10 @@ struct ReceiveView: View {
         if effectiveAddressIndex == 0 {
             return "Main Address"
         } else {
+            let subaddresses = walletManager.subaddresses.filter { $0.index > 0 && !$0.address.isEmpty }
+            if let position = subaddresses.firstIndex(where: { $0.index == effectiveAddressIndex }) {
+                return "Subaddress #\(position + 1)"
+            }
             return "Subaddress #\(effectiveAddressIndex)"
         }
     }
@@ -80,6 +84,8 @@ struct ReceiveView: View {
                         QRCodeView(content: qrContent)
                             .frame(width: 280, height: 280)
                             .shadow(color: .black.opacity(0.1), radius: 10)
+                            .accessibilityIdentifier("receive.qrCode")
+                            .accessibilityLabel("QR code for receiving Monero")
                     } else {
                         Rectangle()
                             .fill(Color(.secondarySystemBackground))
@@ -100,9 +106,12 @@ struct ReceiveView: View {
                             TextField("0.0", text: $requestAmount)
                                 .font(.system(.body, design: .rounded))
                                 .keyboardType(.decimalPad)
+                                .accessibilityLabel("Request amount in XMR")
+                                .accessibilityHint("Enter an optional amount to embed in the QR code")
 
                             Text("XMR")
                                 .foregroundColor(.secondary)
+                                .accessibilityHidden(true)
                         }
                         .padding()
                         .background(Color(.secondarySystemBackground))
@@ -156,11 +165,15 @@ struct ReceiveView: View {
                                 }
                                 .foregroundColor(.orange)
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                .accessibilityElement(children: .combine)
+                                .accessibilityLabel("Privacy warning: Main address links all transactions. Use subaddresses for privacy.")
                             }
                         }
                         .padding()
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                     }
+                    .accessibilityLabel("\(addressLabel), \(formatAddress(currentAddress))")
+                    .accessibilityHint("Opens address picker to change receiving address")
                     .padding(.horizontal)
 
                     // Action Buttons
@@ -180,6 +193,9 @@ struct ReceiveView: View {
                             .padding(.vertical, 16)
                         }
                         .glassButtonStyle()
+                        .accessibilityIdentifier("receive.copyButton")
+                        .accessibilityLabel(copied ? "Address copied" : "Copy address")
+                        .accessibilityHint("Copies the Monero address to clipboard")
 
                         // Share Button
                         Button {
@@ -196,6 +212,8 @@ struct ReceiveView: View {
                             .padding(.vertical, 16)
                         }
                         .glassButtonStyle()
+                        .accessibilityLabel("Share address")
+                        .accessibilityHint("Opens share sheet with QR code and address")
                     }
                     .padding(.horizontal)
                     .disabled(currentAddress == "Loading...")
@@ -259,6 +277,12 @@ struct AddressPickerView: View {
     @Environment(\.dismiss) var dismiss
     @Binding var selectedIndex: Int
     @State private var isCreating = false
+    @State private var showCreateError = false
+
+    /// Subaddress creation only needs the wallet pointer (key derivation), not daemon sync
+    private var canCreateSubaddress: Bool {
+        !walletManager.primaryAddress.isEmpty
+    }
 
     var body: some View {
         ScrollView {
@@ -295,17 +319,16 @@ struct AddressPickerView: View {
                                 .font(.subheadline)
                         }
                     }
-                    .disabled(isCreating)
+                    .disabled(isCreating || !canCreateSubaddress)
+                    .accessibilityLabel(isCreating ? "Creating subaddress" : "Create new subaddress")
+                    .accessibilityHint("Creates a new subaddress for receiving Monero")
                 }
                 .padding(.horizontal, 4)
                 .padding(.top, 8)
 
-                // Only show subaddresses the user explicitly created
-                // Filter out index 0 (main address shown above), empty addresses, and auto-created ones
+                // Show all subaddresses except index 0 (main address shown above)
                 let actualSubaddresses = walletManager.subaddresses.filter {
-                    $0.index > 0 &&
-                    !$0.address.isEmpty &&
-                    walletManager.userCreatedSubaddressIndices.contains($0.index)
+                    $0.index > 0 && !$0.address.isEmpty
                 }
 
                 if actualSubaddresses.isEmpty {
@@ -326,9 +349,9 @@ struct AddressPickerView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 32)
                 } else {
-                    ForEach(actualSubaddresses, id: \.index) { subaddr in
+                    ForEach(Array(actualSubaddresses.enumerated()), id: \.element.index) { position, subaddr in
                         AddressCard(
-                            label: "Subaddress #\(subaddr.index)",
+                            label: "Subaddress #\(position + 1)",
                             address: subaddr.address,
                             index: subaddr.index,
                             isSelected: selectedIndex == subaddr.index,
@@ -344,13 +367,24 @@ struct AddressPickerView: View {
         }
         .navigationTitle("Select Address")
         .navigationBarTitleDisplayMode(.inline)
+        .alert("Couldn't Create Address", isPresented: $showCreateError) {
+            Button("OK") {}
+        } message: {
+            Text("Please wait until the wallet finishes syncing and try again.")
+        }
     }
 
     private func createNewSubaddress() {
         isCreating = true
 
         Task {
-            let result = walletManager.createSubaddress()
+            var result = walletManager.createSubaddress()
+
+            // Retry once after short delay — wallet2 C++ can fail transiently after node switch
+            if result == nil {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                result = walletManager.createSubaddress()
+            }
 
             await MainActor.run {
                 isCreating = false
@@ -359,6 +393,7 @@ struct AddressPickerView: View {
                     let generator = UINotificationFeedbackGenerator()
                     generator.notificationOccurred(.success)
                 } else {
+                    showCreateError = true
                     let generator = UINotificationFeedbackGenerator()
                     generator.notificationOccurred(.error)
                 }
@@ -440,6 +475,9 @@ struct AddressCard: View {
             )
         }
         .buttonStyle(AddressCardButtonStyle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label), \(isSelected ? "selected" : "not selected")\(showWarning ? ", warning: links all transactions together" : "")")
+        .accessibilityHint("Double tap to select this address")
     }
 
     private func formatAddress(_ addr: String) -> String {

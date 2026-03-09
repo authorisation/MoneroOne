@@ -12,18 +12,22 @@ class SyncActivityManager: ObservableObject {
     private var isStartingActivity = false
     private var refreshTimer: Timer?
     private var isSynced = false
+    private var currentLocationName: String?  // Track current trusted location
+    private var isUntrustedLocation = false  // Track untrusted location state
 
     private init() {}
 
     /// Start a new Live Activity for sync progress
-    func startActivity() async {
+    func startActivity(locationName: String? = nil, isUntrusted: Bool = false) async {
         // Prevent concurrent calls
         guard !isStartingActivity else { return }
         isStartingActivity = true
         defer { isStartingActivity = false }
 
+        currentLocationName = locationName
+        isUntrustedLocation = isUntrusted
+
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
-            print("Live Activities not enabled")
             return
         }
 
@@ -32,7 +36,6 @@ class SyncActivityManager: ObservableObject {
             currentActivity = existing
             isActivityRunning = true
             isSynced = false  // Reset sync state for new sync cycle
-            print("Reusing existing sync Live Activity")
 
             // Update activity to show connecting state (not stale "Synced" from previous cycle)
             let state = SyncActivityAttributes.ContentState(
@@ -40,7 +43,9 @@ class SyncActivityManager: ObservableObject {
                 blocksRemaining: nil,
                 isSynced: false,
                 isConnecting: true,
-                lastUpdated: Date()
+                lastUpdated: Date(),
+                trustedLocationName: locationName,
+                isUntrustedLocation: isUntrusted
             )
             Task {
                 await existing.update(ActivityContent(state: state, staleDate: nil))
@@ -56,7 +61,9 @@ class SyncActivityManager: ObservableObject {
             blocksRemaining: nil,
             isSynced: false,
             isConnecting: true,
-            lastUpdated: Date()
+            lastUpdated: Date(),
+            trustedLocationName: locationName,
+            isUntrustedLocation: isUntrusted
         )
 
         do {
@@ -67,25 +74,32 @@ class SyncActivityManager: ObservableObject {
             )
             isActivityRunning = true
             isSynced = false
-            print("Started sync Live Activity")
             startRefreshTimer()
         } catch {
-            print("Failed to start Live Activity: \(error)")
+            // Activity request failed - not critical
         }
     }
 
     /// Update the Live Activity with new sync progress
-    func updateProgress(_ progress: Double, blocksRemaining: Int? = nil) {
+    func updateProgress(_ progress: Double, blocksRemaining: Int? = nil, locationName: String? = nil, isUntrusted: Bool? = nil) {
         guard let activity = currentActivity else { return }
 
         isSynced = false
+        if let name = locationName {
+            currentLocationName = name
+        }
+        if let untrusted = isUntrusted {
+            isUntrustedLocation = untrusted
+        }
 
         let state = SyncActivityAttributes.ContentState(
             progress: progress,
             blocksRemaining: blocksRemaining,
             isSynced: false,
             isConnecting: false,
-            lastUpdated: Date()
+            lastUpdated: Date(),
+            trustedLocationName: currentLocationName,
+            isUntrustedLocation: isUntrustedLocation
         )
 
         Task {
@@ -96,17 +110,25 @@ class SyncActivityManager: ObservableObject {
     }
 
     /// Mark sync as complete - Activity stays visible until next sync cycle
-    func markSynced() {
+    func markSynced(locationName: String? = nil, isUntrusted: Bool? = nil) {
         guard let activity = currentActivity else { return }
 
         isSynced = true
+        if let name = locationName {
+            currentLocationName = name
+        }
+        if let untrusted = isUntrusted {
+            isUntrustedLocation = untrusted
+        }
 
         let state = SyncActivityAttributes.ContentState(
             progress: 100,
             blocksRemaining: 0,
             isSynced: true,
             isConnecting: false,
-            lastUpdated: Date()
+            lastUpdated: Date(),
+            trustedLocationName: currentLocationName,
+            isUntrustedLocation: isUntrustedLocation
         )
 
         Task {
@@ -117,17 +139,56 @@ class SyncActivityManager: ObservableObject {
     }
 
     /// Mark activity as connecting (checking for new blocks)
-    func markConnecting() {
+    func markConnecting(locationName: String? = nil, isUntrusted: Bool? = nil) {
         guard let activity = currentActivity else { return }
 
         isSynced = false
+        if let name = locationName {
+            currentLocationName = name
+        }
+        if let untrusted = isUntrusted {
+            isUntrustedLocation = untrusted
+        }
 
         let state = SyncActivityAttributes.ContentState(
             progress: 0,
             blocksRemaining: nil,
             isSynced: false,
             isConnecting: true,
-            lastUpdated: Date()
+            lastUpdated: Date(),
+            trustedLocationName: currentLocationName,
+            isUntrustedLocation: isUntrustedLocation
+        )
+
+        Task {
+            await activity.update(ActivityContent(state: state, staleDate: nil))
+        }
+    }
+
+    /// Mark sync as blocked — outside trusted zone in block mode
+    func markBlocked(locationName: String? = nil) {
+        guard let activity = currentActivity else {
+            // Need to start an activity to show blocked state
+            Task {
+                await startActivity()
+                markBlocked(locationName: locationName)
+            }
+            return
+        }
+
+        isSynced = false
+        if let name = locationName {
+            currentLocationName = name
+        }
+
+        let state = SyncActivityAttributes.ContentState(
+            progress: 0,
+            blocksRemaining: nil,
+            isSynced: false,
+            isConnecting: false,
+            lastUpdated: Date(),
+            trustedLocationName: currentLocationName,
+            isBlocked: true
         )
 
         Task {

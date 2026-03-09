@@ -11,11 +11,14 @@ struct WelcomeView: View {
 
                 // Animated Monero Logo
                 AnimatedMoneroLogo(size: 240)
+                    .accessibilityHidden(true)
 
                 VStack(spacing: 8) {
                     Text("Monero One")
                         .font(.largeTitle)
                         .fontWeight(.bold)
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityIdentifier("welcome.title")
 
                     Text("Simple. Private. Secure.")
                         .font(.subheadline)
@@ -39,6 +42,9 @@ struct WelcomeView: View {
                         .padding(.vertical, 12)
                     }
                     .glassButtonStyle()
+                    .accessibilityLabel("Create New Wallet")
+                    .accessibilityHint("Double tap to create a new Monero wallet")
+                    .accessibilityIdentifier("welcome.createButton")
 
                     Button {
                         showRestore = true
@@ -54,6 +60,9 @@ struct WelcomeView: View {
                         .padding(.vertical, 12)
                     }
                     .glassButtonStyle()
+                    .accessibilityLabel("Restore Wallet")
+                    .accessibilityHint("Double tap to restore an existing wallet from a seed phrase")
+                    .accessibilityIdentifier("welcome.restoreButton")
                 }
                 .padding(.horizontal, 40)
                 .padding(.bottom, 32)

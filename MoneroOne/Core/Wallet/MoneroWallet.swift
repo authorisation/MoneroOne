@@ -46,7 +46,7 @@ class MoneroWallet: ObservableObject {
     ///   - node: Optional custom node
     ///   - resetSuffix: Optional suffix to force new walletId (used for reset sync)
     ///   - networkType: Mainnet or testnet
-    func create(seed: [String], restoreHeight: UInt64 = 0, node: MoneroKit.Node? = nil, resetSuffix: String? = nil, networkType: MoneroKit.NetworkType = .mainnet) throws {
+    func create(seed: [String], restoreHeight: UInt64 = 0, node: MoneroKit.Node? = nil, resetSuffix: String? = nil, networkType: MoneroKit.NetworkType = .mainnet) async throws {
         let walletNode = node ?? defaultNode(for: networkType)
         var walletId = Self.stableWalletId(for: seed)
 
@@ -70,82 +70,87 @@ class MoneroWallet: ObservableObject {
             credentials = MoneroKit.MoneroWallet.bip39(seed: seed, passphrase: "")
         }
 
-        kit = try MoneroKit.Kit(
-            wallet: credentials,
-            account: 0,
-            restoreHeight: restoreHeight,
-            walletId: walletId,
-            node: walletNode,
-            networkType: networkType,
-            reachabilityManager: reachabilityManager,
-            logger: nil
-        )
+        // Heavy Kit init (SQLite + C++ + crypto) off main thread
+        let reachability = reachabilityManager
+        let newKit = try await Task.detached {
+            try MoneroKit.Kit(
+                wallet: credentials,
+                account: 0,
+                restoreHeight: restoreHeight,
+                walletId: walletId,
+                node: walletNode,
+                networkType: networkType,
+                reachabilityManager: reachability,
+                logger: nil
+            )
+        }.value
 
+        kit = newKit
         setupKit()
     }
 
     /// Create watch-only wallet
-    func createWatchOnly(address: String, viewKey: String, restoreHeight: UInt64 = 0, node: MoneroKit.Node? = nil, networkType: MoneroKit.NetworkType = .mainnet) throws {
+    func createWatchOnly(address: String, viewKey: String, restoreHeight: UInt64 = 0, node: MoneroKit.Node? = nil, networkType: MoneroKit.NetworkType = .mainnet) async throws {
         let walletNode = node ?? defaultNode(for: networkType)
         let networkSuffix = networkType == .testnet ? "_testnet" : ""
         let walletId = Self.stableWalletId(for: address + viewKey + networkSuffix)
 
-        kit = try MoneroKit.Kit(
-            wallet: .watch(address: address, viewKey: viewKey),
-            account: 0,
-            restoreHeight: restoreHeight,
-            walletId: walletId,
-            node: walletNode,
-            networkType: networkType,
-            reachabilityManager: reachabilityManager,
-            logger: nil
-        )
+        // Heavy Kit init (SQLite + C++ + crypto) off main thread
+        let reachability = reachabilityManager
+        let newKit = try await Task.detached {
+            try MoneroKit.Kit(
+                wallet: .watch(address: address, viewKey: viewKey),
+                account: 0,
+                restoreHeight: restoreHeight,
+                walletId: walletId,
+                node: walletNode,
+                networkType: networkType,
+                reachabilityManager: reachability,
+                logger: nil
+            )
+        }.value
 
+        kit = newKit
         setupKit()
     }
 
     private func defaultNode(for networkType: MoneroKit.NetworkType = .mainnet) -> MoneroKit.Node {
-        if networkType == .testnet {
-            // Testnet node (port 28081)
-            let defaultTestnetURL = Self.testnetNodes.first?.url ?? "http://testnet.xmr-tw.org:28081"
-            let testnetURL = UserDefaults.standard.string(forKey: "selectedTestnetNodeURL") ?? defaultTestnetURL
-            // Use default if URL is invalid
-            let url = URL(string: testnetURL) ?? URL(string: defaultTestnetURL)!
-            return MoneroKit.Node(
-                url: url,
-                isTrusted: false,
-                login: nil,
-                password: nil
-            )
-        } else {
-            // Mainnet - Load from UserDefaults or use default
-            let defaultMainnetURL = "https://xmr-node.cakewallet.com:18081"
-            let savedURL = UserDefaults.standard.string(forKey: "selectedNodeURL") ?? defaultMainnetURL
-            // Use default if URL is invalid
-            let url = URL(string: savedURL) ?? URL(string: defaultMainnetURL)!
-            return MoneroKit.Node(
-                url: url,
-                isTrusted: false,
-                login: nil,
-                password: nil
-            )
+        let isTestnet = networkType == .testnet
+        let urlKey = isTestnet ? "selectedTestnetNodeURL" : "selectedNodeURL"
+        let loginKey = isTestnet ? "selectedTestnetNodeLogin" : "selectedNodeLogin"
+        let passwordKey = isTestnet ? "selectedTestnetNodePassword" : "selectedNodePassword"
+
+        let defaultURL = isTestnet
+            ? (Self.testnetNodes.first?.url ?? "http://testnet.xmr-tw.org:28081")
+            : "https://node.monero.one:443"
+        let savedURL = UserDefaults.standard.string(forKey: urlKey) ?? defaultURL
+        guard let url = URL(string: savedURL) ?? URL(string: defaultURL) else {
+            return MoneroKit.Node(url: URL(string: "https://node.monero.one:443")!, isTrusted: false)
         }
+
+        let login = UserDefaults.standard.string(forKey: loginKey)
+        let password = UserDefaults.standard.string(forKey: passwordKey)
+        let proxy = UserDefaults.standard.string(forKey: "proxyAddress")
+
+        return MoneroKit.Node(
+            url: url,
+            isTrusted: false,
+            login: login,
+            password: password,
+            proxy: proxy
+        )
     }
 
-    /// Available public mainnet nodes
-    static let publicNodes: [(name: String, url: String)] = [
-        ("CakeWallet", "https://xmr-node.cakewallet.com:18081"),
-        ("MoneroWorld", "https://node.moneroworld.com:18089"),
-        ("Community Node", "https://nodes.hashvault.pro:18081"),
-        ("XMR.to", "https://node.xmr.to:18081")
-    ]
-
+    #if DEBUG
     /// Available public testnet nodes (port 28081/28089)
     /// Note: Testnet nodes are often unreliable. MoneroKit doesn't support stagenet.
     static let testnetNodes: [(name: String, url: String)] = [
         ("Monero Project", "http://testnet.xmr-tw.org:28081"),
         ("MoneroDevs", "http://node.monerodevs.org:28089"),
     ]
+    #else
+    static let testnetNodes: [(name: String, url: String)] = []
+    #endif
 
     private func setupKit() {
         guard let kit = kit else { return }
@@ -189,6 +194,11 @@ class MoneroWallet: ObservableObject {
     /// Restart sync to check for new blocks
     func startSync() {
         kit?.startSync()
+    }
+
+    /// Pause sync — stops refresh and state polling
+    func pauseSync() {
+        kit?.pauseSync()
     }
 
     // MARK: - Balance
@@ -266,18 +276,18 @@ class MoneroWallet: ObservableObject {
         let fee = Decimal(info.fee) / coinRate
 
         // Calculate confirmations from block height
-        let confirmations: Int
+        let confirmations: Int?
         if info.isPending || info.blockHeight == 0 {
             confirmations = 0
         } else if let kit = kit {
-            let currentHeight = kit.lastBlockInfo
+            let currentHeight = kit.blockHeights?.daemonHeight ?? kit.lastBlockInfo
             if currentHeight > info.blockHeight {
                 confirmations = Int(currentHeight - info.blockHeight)
             } else {
-                confirmations = 10 // Assume confirmed if we can't calculate
+                confirmations = nil // Height not available yet
             }
         } else {
-            confirmations = 10 // Default to confirmed if kit unavailable
+            confirmations = nil
         }
 
         // Determine status based on isPending from MoneroKit (this is accurate!)
@@ -314,7 +324,9 @@ class MoneroWallet: ObservableObject {
         let piconero = Int((amount * coinRate) as NSDecimalNumber)
         writeDebugLog("estimateFee: calling kit.estimateFee with piconero=\(piconero)")
         do {
-            let fee = try kit.estimateFee(address: address, amount: .value(piconero), priority: priority)
+            let fee = try await Task.detached {
+                try kit.estimateFee(address: address, amount: .value(piconero), priority: priority)
+            }.value
             writeDebugLog("estimateFee: success, fee=\(fee)")
             return Decimal(fee) / coinRate
         } catch {
@@ -325,6 +337,7 @@ class MoneroWallet: ObservableObject {
         }
     }
 
+    #if DEBUG
     private func writeDebugLog(_ message: String) {
         guard let documentDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
             return
@@ -344,23 +357,51 @@ class MoneroWallet: ObservableObject {
             }
         }
     }
+    #else
+    private func writeDebugLog(_ message: String) {
+        // No-op in release builds
+    }
+    #endif
 
     func send(to address: String, amount: Decimal, priority: SendPriority = .default, memo: String? = nil) async throws -> String {
         guard let kit = kit else { throw WalletError.notUnlocked }
 
         let piconero = Int((amount * coinRate) as NSDecimalNumber)
-        try await kit.send(to: address, amount: .value(piconero), priority: priority, memo: memo)
-        // MoneroKit send doesn't return a hash directly - fetch from recent transactions
+        writeDebugLog("send: starting send to \(address.prefix(16))..., piconero=\(piconero)")
+
+        try await Task.detached {
+            try kit.send(to: address, amount: .value(piconero), priority: priority, memo: memo)
+        }.value
+        writeDebugLog("send: kit.send completed, fetching transactions")
+
+        let txId = await Task.detached { () -> String in
+            let txInfos = kit.transactions(fromHash: nil, descending: true, type: nil, limit: 1)
+            return txInfos.first?.hash ?? ""
+        }.value
+        writeDebugLog("send: got txId=\(txId)")
+
         fetchTransactions()
-        return transactions.first?.id ?? ""
+        return txId
     }
 
     func sendAll(to address: String, priority: SendPriority = .default, memo: String? = nil) async throws -> String {
         guard let kit = kit else { throw WalletError.notUnlocked }
 
-        try await kit.send(to: address, amount: .all, priority: priority, memo: memo)
+        writeDebugLog("sendAll: starting sweep to \(address.prefix(16))...")
+
+        try await Task.detached {
+            try kit.send(to: address, amount: .all, priority: priority, memo: memo)
+        }.value
+        writeDebugLog("sendAll: kit.send completed, fetching transactions")
+
+        let txId = await Task.detached { () -> String in
+            let txInfos = kit.transactions(fromHash: nil, descending: true, type: nil, limit: 1)
+            return txInfos.first?.hash ?? ""
+        }.value
+        writeDebugLog("sendAll: got txId=\(txId)")
+
         fetchTransactions()
-        return transactions.first?.id ?? ""
+        return txId
     }
 
     // MARK: - Subaddresses
@@ -404,6 +445,9 @@ class MoneroWallet: ObservableObject {
 
 extension MoneroWallet: MoneroKitDelegate {
     nonisolated func subAddressesUpdated(subaddresses: [MoneroKit.SubAddress]) {
+        #if DEBUG
+        NSLog("[MoneroWallet] subAddressesUpdated: count=%d", subaddresses.count)
+        #endif
         Task { @MainActor in
             self.subaddresses = subaddresses
         }
@@ -437,7 +481,7 @@ struct MoneroTransaction: Identifiable, Equatable, Hashable {
     let fee: Decimal
     let address: String
     let timestamp: Date
-    let confirmations: Int
+    let confirmations: Int?
     let status: TransactionStatus
     let memo: String?
 

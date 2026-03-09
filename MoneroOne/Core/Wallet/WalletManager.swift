@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import QuartzCore
 import HdWalletKit
 import MoneroKit
 import CMonero
@@ -19,6 +20,7 @@ class WalletManager: ObservableObject {
     @Published var transactions: [MoneroTransaction] = []
     @Published var subaddresses: [MoneroKit.SubAddress] = []
     @Published var userCreatedSubaddressIndices: Set<Int> = []
+    @Published private(set) var walletSessionId = UUID()
 
     // Send prefill properties (for donation flow)
     @Published var prefillSendAddress: String?
@@ -35,6 +37,20 @@ class WalletManager: ObservableObject {
     private var networkMonitorCancellable: AnyCancellable?
     private var connectionTimer: Timer?
     private var connectionStartTime: Date?
+    private var reachabilityRetryTask: Task<Void, Never>?
+    private var restartTask: Task<Void, Never>?
+    private var reachabilityRetryCount: Int = 0
+    private var currentReachabilityTask: URLSessionDataTask?
+    private var lastSyncPublish: Double = 0
+
+    /// URLSession that accepts all certificates (matches NodeManager behavior)
+    /// Nodes with self-signed certs pass the settings latency test, so the wallet
+    /// reachability test must also accept them to avoid a stuck "Reaching node..." state.
+    private lazy var reachabilitySession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 10
+        return URLSession(configuration: config, delegate: AllCertsTrustDelegate.shared, delegateQueue: nil)
+    }()
 
     enum SyncState: Equatable {
         case idle
@@ -108,7 +124,9 @@ class WalletManager: ObservableObject {
     /// Polyseed includes an embedded wallet birthday for faster restoration
     func generatePolyseed() -> [String] {
         guard let seedPtr = MONERO_Wallet_createPolyseed("English") else {
+            #if DEBUG
             print("Polyseed generation failed: null pointer returned")
+            #endif
             return []
         }
         let seedString = String(cString: seedPtr)
@@ -116,7 +134,9 @@ class WalletManager: ObservableObject {
 
         // Polyseed should always be 16 words
         guard words.count == 16 else {
+            #if DEBUG
             print("Polyseed generation failed: expected 16 words, got \(words.count)")
+            #endif
             return []
         }
 
@@ -130,7 +150,9 @@ class WalletManager: ObservableObject {
             let mnemonic = try Mnemonic.generate(wordCount: .twentyFour, language: .english)
             return mnemonic
         } catch {
+            #if DEBUG
             print("BIP39 mnemonic generation failed: \(error)")
+            #endif
             return []
         }
     }
@@ -209,7 +231,7 @@ class WalletManager: ObservableObject {
 
     // MARK: - Wallet Unlock
 
-    func unlock(pin: String) throws {
+    func unlock(pin: String) async throws {
         guard let seedPhrase = try keychain.getSeed(pin: pin) else {
             throw WalletError.invalidPin
         }
@@ -224,7 +246,7 @@ class WalletManager: ObservableObject {
         let resetSuffix: String? = resetCount > 0 ? "\(resetCount)" : nil
 
         do {
-            try wallet.create(seed: mnemonic, restoreHeight: walletRestoreHeight, resetSuffix: resetSuffix, networkType: networkType)
+            try await wallet.create(seed: mnemonic, restoreHeight: walletRestoreHeight, resetSuffix: resetSuffix, networkType: networkType)
         } catch {
             throw WalletError.invalidMnemonic
         }
@@ -247,6 +269,7 @@ class WalletManager: ObservableObject {
         startConnectionTracking()
 
         isUnlocked = true
+        walletSessionId = UUID()
     }
 
     private func bindToWallet(_ wallet: MoneroWallet) {
@@ -275,6 +298,11 @@ class WalletManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
                 guard let self = self else { return }
+
+                // When sync is blocked, ignore state updates from the engine
+                // (wallet2 may fire trailing callbacks after pauseRefresh)
+                if self.isSyncBlocked { return }
+
                 let newState: SyncState
                 switch state {
                 case .idle: newState = .idle
@@ -284,7 +312,33 @@ class WalletManager: ObservableObject {
                 case .synced: newState = .synced
                 case .error(let msg): newState = .error(msg)
                 }
+
+                // Don't let the wallet's initial .idle publish regress from .connecting
+                // during a restart — restartWallet() sets .connecting manually before
+                // the new wallet is created, so the first .idle from wallet2 is stale.
+                if case .idle = newState, case .connecting = self.syncState {
+                    return
+                }
+
+                // Throttle rapid syncing progress updates to prevent SwiftUI
+                // view re-renders from swallowing NavigationLink taps.
+                // State transitions (idle/connecting/synced/error) pass immediately.
+                if case .syncing = newState, case .syncing = self.syncState {
+                    let now = CACurrentMediaTime()
+                    if now - self.lastSyncPublish < 0.25 { return }
+                    self.lastSyncPublish = now
+                }
+
                 self.syncState = newState
+
+                // wallet2 C++ is connecting — cancel HTTP reachability checks
+                // since wallet2 handles TLS/connection independently
+                if case .connecting = newState {
+                    self.reachabilityRetryTask?.cancel()
+                    self.reachabilityRetryTask = nil
+                    self.currentReachabilityTask?.cancel()
+                    self.currentReachabilityTask = nil
+                }
 
                 // Update connection stage based on sync state
                 self.updateConnectionStage()
@@ -332,9 +386,16 @@ class WalletManager: ObservableObject {
             .sink { [weak self] newSubaddresses in
                 guard let self = self else { return }
                 self.subaddresses = newSubaddresses
+                let hasValidIdx0 = newSubaddresses.contains { $0.index == 0 && !$0.address.isEmpty }
+                #if DEBUG
+                NSLog("[WalletManager] $subaddresses: count=%d hasValidIdx0=%d primaryAddr.empty=%d", newSubaddresses.count, hasValidIdx0 ? 1 : 0, self.primaryAddress.isEmpty ? 1 : 0)
+                #endif
                 // Update primaryAddress when subaddresses change (polyseed case - addresses populate after wallet opens)
-                if let primary = newSubaddresses.first(where: { $0.index == 0 }), !primary.address.isEmpty {
+                if let primary = newSubaddresses.first(where: { $0.index == 0 && !$0.address.isEmpty }) {
                     if self.primaryAddress.isEmpty {
+                        #if DEBUG
+                        NSLog("[WalletManager] SETTING primaryAddress from subaddresses sink")
+                        #endif
                         self.primaryAddress = primary.address
                     }
                 }
@@ -360,8 +421,15 @@ class WalletManager: ObservableObject {
     }
 
     func lock() {
-        moneroWallet?.stop()
+        // Cancel Combine subscriptions FIRST — they hold strong refs to the old wallet
+        cancellables.removeAll()
+
+        // Capture old wallet so its deallocation (Kit.deinit → C++ close)
+        // happens off the main thread.
+        let oldWallet = moneroWallet
         moneroWallet = nil
+        Task.detached { [oldWallet] in let _ = oldWallet }
+
         currentSeed = nil
         isUnlocked = false
         balance = 0
@@ -377,6 +445,9 @@ class WalletManager: ObservableObject {
         daemonHeight = 0
         walletHeight = 0
         nodeReachable = nil
+        reachabilityRetryCount = 0
+        reachabilityRetryTask?.cancel()
+        reachabilityRetryTask = nil
         networkMonitorCancellable?.cancel()
         networkMonitorCancellable = nil
     }
@@ -400,7 +471,21 @@ class WalletManager: ObservableObject {
 
         // Stage 4: Got daemon height, loading blocks - show wallet height climbing
         if daemonHeight > 0 {
-            connectionStage = .loadingBlocks(wallet: walletHeight, daemon: daemonHeight)
+            // If wallet has caught up to daemon, show syncing (waiting for C++ synchronized flag)
+            if walletHeight >= daemonHeight {
+                connectionStage = .syncing
+            } else {
+                connectionStage = .loadingBlocks(wallet: walletHeight, daemon: daemonHeight)
+            }
+            return
+        }
+
+        // Stage 3b: MoneroKit reports actively connecting - trust it over HTTP test
+        if case .connecting = syncState {
+            #if DEBUG
+            NSLog("[WalletManager] MoneroKit reports .connecting — overriding reachability (nodeReachable=%@)", String(describing: nodeReachable))
+            #endif
+            connectionStage = .connecting
             return
         }
 
@@ -410,9 +495,10 @@ class WalletManager: ObservableObject {
             return
         }
 
-        // Stage 2: Node not reachable
+        // Stage 2: Node not reachable — schedule retry
         if nodeReachable == false {
             connectionStage = .reachingNode
+            scheduleReachabilityRetry()
             return
         }
 
@@ -432,14 +518,22 @@ class WalletManager: ObservableObject {
         // Load restore height for stage calculation
         restoreHeight = UInt64(UserDefaults.standard.integer(forKey: "\(networkPrefix)restoreHeight"))
 
-        // Reset node reachability
+        // Reset node reachability and retry state
         nodeReachable = nil
+        reachabilityRetryCount = 0
+        reachabilityRetryTask?.cancel()
+        reachabilityRetryTask = nil
+        currentReachabilityTask?.cancel()
+        currentReachabilityTask = nil
 
         // Subscribe to network connectivity changes
         networkMonitorCancellable = NetworkMonitor.shared.$isConnected
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isConnected in
                 guard let self = self else { return }
+                #if DEBUG
+                NSLog("[WalletManager] Network connectivity changed: %@", isConnected ? "connected" : "disconnected")
+                #endif
                 if !isConnected {
                     self.nodeReachable = nil
                 }
@@ -453,8 +547,13 @@ class WalletManager: ObservableObject {
     /// Test if the node is reachable via HTTP GET to /get_info
     private func testNodeReachability() {
         // Get node URL from UserDefaults
+        #if DEBUG
+        let defaultURL = isTestnet ? "http://testnet.xmr-tw.org:28081" : "https://node.monero.one:443"
+        #else
+        let defaultURL = "https://node.monero.one:443"
+        #endif
         let nodeURLString = UserDefaults.standard.string(forKey: isTestnet ? "selectedTestnetNodeURL" : "selectedNodeURL")
-            ?? (isTestnet ? "http://testnet.xmr-tw.org:28081" : "https://xmr-node.cakewallet.com:18081")
+            ?? defaultURL
 
         guard let baseURL = URL(string: nodeURLString) else {
             nodeReachable = false
@@ -468,22 +567,68 @@ class WalletManager: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 10
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        // Cancel any in-flight reachability check to avoid stale results
+        currentReachabilityTask?.cancel()
+
+        let task = reachabilitySession.dataTask(with: request) { [weak self] data, response, error in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+
+                // Ignore cancelled requests (stale checks from previous node)
+                if let urlError = error as? URLError, urlError.code == .cancelled {
+                    #if DEBUG
+                    NSLog("[WalletManager] Reachability check cancelled (stale), ignoring")
+                    #endif
+                    return
+                }
 
                 if let httpResponse = response as? HTTPURLResponse,
                    (200...299).contains(httpResponse.statusCode),
                    let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    json["height"] != nil || json["status"] != nil {
+                    #if DEBUG
+                    NSLog("[WalletManager] Node reachable: %@", nodeURLString)
+                    #endif
                     self.nodeReachable = true
+                    self.reachabilityRetryCount = 0
+                    self.reachabilityRetryTask?.cancel()
+                    self.reachabilityRetryTask = nil
                 } else {
+                    #if DEBUG
+                    NSLog("[WalletManager] Node unreachable: %@ (HTTP %d)", nodeURLString, (response as? HTTPURLResponse)?.statusCode ?? 0)
+                    #endif
                     self.nodeReachable = false
                 }
                 self.updateConnectionStage()
             }
-        }.resume()
+        }
+        currentReachabilityTask = task
+        task.resume()
+    }
+
+    /// Retry reachability test with exponential backoff (5s, 10s, 20s)
+    private func scheduleReachabilityRetry() {
+        // Don't schedule if already retrying or max attempts reached
+        guard reachabilityRetryTask == nil, reachabilityRetryCount < 3 else { return }
+
+        let delay: UInt64 = switch reachabilityRetryCount {
+        case 0: 5_000_000_000   // 5s
+        case 1: 10_000_000_000  // 10s
+        default: 20_000_000_000 // 20s
+        }
+
+        reachabilityRetryCount += 1
+        #if DEBUG
+        NSLog("[WalletManager] Scheduling reachability retry %d/3 in %ds", reachabilityRetryCount, delay / 1_000_000_000)
+        #endif
+
+        reachabilityRetryTask = Task {
+            try? await Task.sleep(nanoseconds: delay)
+            guard !Task.isCancelled else { return }
+            self.reachabilityRetryTask = nil
+            self.testNodeReachability()
+        }
     }
 
     // MARK: - Widget Data
@@ -522,7 +667,7 @@ class WalletManager: ObservableObject {
                 amount: tx.amount,
                 amountFormatted: formatter.string(from: tx.amount as NSDecimalNumber) ?? "0.0000",
                 timestamp: tx.timestamp,
-                isConfirmed: tx.confirmations >= 10
+                isConfirmed: (tx.confirmations ?? 0) >= 10
             )
         }
 
@@ -542,19 +687,17 @@ class WalletManager: ObservableObject {
     }
 
     /// Save widget data if widget is enabled - called during sync cycles
-    /// Uses debouncing to prevent UI freezes from rapid widget reloads
+    /// Debounced: batches rapid updates into a single save + reload after 1 second
     private func saveWidgetDataIfEnabled() {
         guard UserDefaults.standard.bool(forKey: "widgetEnabled") else { return }
-        saveWidgetData()
-        scheduleWidgetReload()
-    }
 
-    /// Debounced widget reload - waits 1 second before reloading to batch rapid updates
-    private func scheduleWidgetReload() {
+        // Debounce: cancel any pending save and schedule a new one.
+        // This avoids JSON encode + file I/O on every balance/tx/state change.
         widgetReloadTask?.cancel()
         widgetReloadTask = Task {
             try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
             guard !Task.isCancelled else { return }
+            self.saveWidgetData()
             WidgetCenter.shared.reloadAllTimelines()
         }
     }
@@ -616,33 +759,138 @@ class WalletManager: ObservableObject {
     // MARK: - Refresh
 
     func refresh() async {
-        guard !isRefreshing else { return }
+        guard !isRefreshing, !isSyncBlocked else { return }
         isRefreshing = true
         defer { isRefreshing = false }
+
+        // If stuck on unreachable, reset and re-test (user escape hatch)
+        if nodeReachable == false {
+            #if DEBUG
+            NSLog("[WalletManager] Pull-to-refresh: resetting stuck reachability state")
+            #endif
+            nodeReachable = nil
+            reachabilityRetryCount = 0
+            reachabilityRetryTask?.cancel()
+            reachabilityRetryTask = nil
+            updateConnectionStage()
+        }
 
         // Let MoneroKit determine actual sync state via walletStateDidChange() callback
         // Don't force .connecting - if already synced and no new blocks, stay synced
         moneroWallet?.startSync()
         moneroWallet?.refresh()
-        // Note: Live Activity is updated by BackgroundSyncManager.handleSyncStateChange()
+        // Note: Live Activity is updated by TrustedLocationSyncManager.handleSyncStateChange()
         // when sync state transitions to .synced - no need to call markSynced() here
     }
 
     /// Restart sync to check for new blocks
     func startSync() {
+        guard !isSyncBlocked else { return }
         moneroWallet?.startSync()
+    }
+
+    /// Whether sync is blocked (e.g. outside trusted zone in block mode)
+    /// When true, startSync() and refresh() become no-ops
+    var isSyncBlocked: Bool = false
+
+    /// Pause sync — stops refresh and state polling
+    func pauseSync() {
+        isSyncBlocked = true
+        moneroWallet?.pauseSync()
+        syncState = .idle
+    }
+
+    /// Resume sync capability (does not start sync, just unblocks it)
+    func resumeSync() {
+        isSyncBlocked = false
     }
 
     // MARK: - Node Management
 
-    /// Save new node URL - takes effect on next app restart
-    /// Returns true if restart is needed for change to take effect
+    /// Set node URL and restart wallet to use new node immediately
     @discardableResult
-    func setNode(url: String, isTrusted: Bool = false) -> Bool {
-        UserDefaults.standard.set(url, forKey: "selectedNodeURL")
-        // Node change saved - will take effect on next app restart
-        // We don't restart immediately to avoid race conditions with MoneroKit's internal sync loop
+    func setNode(url: String, isTrusted: Bool = false, login: String? = nil, password: String? = nil) -> Bool {
+        UserDefaults.standard.set(url, forKey: isTestnet ? "selectedTestnetNodeURL" : "selectedNodeURL")
+        UserDefaults.standard.set(login, forKey: isTestnet ? "selectedTestnetNodeLogin" : "selectedNodeLogin")
+        UserDefaults.standard.set(password, forKey: isTestnet ? "selectedTestnetNodePassword" : "selectedNodePassword")
+
+        if let seed = currentSeed {
+            restartWallet(with: seed)
+        }
         return true
+    }
+
+    // MARK: - Proxy Management
+
+    /// Set SOCKS proxy address and restart wallet to apply
+    func setProxy(_ address: String) {
+        saveProxy(address)
+
+        if let seed = currentSeed {
+            restartWallet(with: seed)
+        }
+    }
+
+    /// Save proxy address to UserDefaults without restarting the wallet.
+    /// Use this when a subsequent setNode() call will trigger the restart.
+    func saveProxy(_ address: String) {
+        let trimmed = address.trimmingCharacters(in: .whitespaces)
+        UserDefaults.standard.set(trimmed, forKey: "proxyAddress")
+    }
+
+    // MARK: - Wallet Restart
+
+    /// Restart the wallet, serializing teardown → create to prevent dual C++ connections.
+    /// The old wallet is stopped explicitly before the new one is created.
+    /// Rapid re-entry (e.g. quick node switching) cancels the in-flight restart.
+    private func restartWallet(with seed: [String]) {
+        guard isUnlocked else { return }
+
+        syncState = .connecting
+
+        // Cancel any in-flight restart
+        restartTask?.cancel()
+
+        let oldWallet = moneroWallet
+        moneroWallet = nil
+        cancellables.removeAll()
+
+        let walletRestoreHeight = UInt64(UserDefaults.standard.integer(forKey: "\(networkPrefix)restoreHeight"))
+        let resetCount = UserDefaults.standard.integer(forKey: "\(networkPrefix)syncResetCount")
+        let resetSuffix: String? = resetCount > 0 ? "\(resetCount)" : nil
+        let netType = networkType
+
+        restartTask = Task {
+            // Stop old wallet explicitly — Kit.stop() queues MoneroCore.stop()
+            // on lifecycleQueue, which calls MONERO_WalletManager_closeWallet()
+            oldWallet?.stop()
+            // Give lifecycleQueue time to process the C++ close
+            try? await Task.sleep(nanoseconds: 100_000_000)
+
+            // Another restart superseded this one
+            guard !Task.isCancelled else { return }
+
+            do {
+                let wallet = MoneroWallet()
+                try await wallet.create(seed: seed, restoreHeight: walletRestoreHeight,
+                                  resetSuffix: resetSuffix, networkType: netType)
+
+                // Check again — create() takes time, another restart may have fired
+                guard !Task.isCancelled else {
+                    wallet.stop()
+                    return
+                }
+
+                self.moneroWallet = wallet
+                self.bindToWallet(wallet)
+                self.walletSessionId = UUID()
+                self.startConnectionTracking()
+            } catch {
+                if !Task.isCancelled {
+                    self.syncState = .error("Failed to reconnect: \(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     // MARK: - Seed Access
@@ -659,7 +907,9 @@ class WalletManager: ObservableObject {
         if !primaryAddress.isEmpty, let currentSeedMnemonic = currentSeed {
             // Compare with the seed that was used to unlock the current wallet
             if mnemonic != currentSeedMnemonic {
+                #if DEBUG
                 NSLog("[WalletManager] CRITICAL: Keychain seed doesn't match unlocked wallet seed!")
+                #endif
                 throw WalletError.seedMismatch
             }
         }
@@ -685,11 +935,11 @@ class WalletManager: ObservableObject {
     }
 
     /// Unlock using biometrics - retrieves PIN via Face ID/Touch ID
-    func unlockWithBiometrics() throws {
+    func unlockWithBiometrics() async throws {
         guard let pin = keychain.getPinWithBiometrics() else {
             throw WalletError.biometricFailed
         }
-        try unlock(pin: pin)
+        try await unlock(pin: pin)
     }
 
     // MARK: - Reset Sync
@@ -706,9 +956,13 @@ class WalletManager: ObservableObject {
         unlockedBalance = 0
         transactions = []
 
-        // Stop current wallet
-        moneroWallet?.stop()
+        // Cancel Combine subscriptions — they hold strong refs to the old wallet
+        cancellables.removeAll()
+
+        // Capture old wallet so its deallocation happens off main thread
+        let oldWallet = moneroWallet
         moneroWallet = nil
+        Task.detached { [oldWallet] in let _ = oldWallet }
 
         // Clear MoneroKit wallet data directory
         clearWalletCache()
@@ -719,14 +973,18 @@ class WalletManager: ObservableObject {
 
         // Get restore height from UserDefaults (network-specific)
         let restoreHeight = UInt64(UserDefaults.standard.integer(forKey: "\(networkPrefix)restoreHeight"))
+        let netType = networkType
 
-        do {
-            let wallet = MoneroWallet()
-            try wallet.create(seed: seed, restoreHeight: restoreHeight, resetSuffix: "\(resetCount)", networkType: networkType)
-            moneroWallet = wallet
-            bindToWallet(wallet)
-        } catch {
-            syncState = .error("Failed to restart wallet: \(error.localizedDescription)")
+        // Create new wallet — Kit init runs off main via async create()
+        Task {
+            do {
+                let wallet = MoneroWallet()
+                try await wallet.create(seed: seed, restoreHeight: restoreHeight, resetSuffix: "\(resetCount)", networkType: netType)
+                self.moneroWallet = wallet
+                self.bindToWallet(wallet)
+            } catch {
+                self.syncState = .error("Failed to restart wallet: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -786,10 +1044,11 @@ class WalletManager: ObservableObject {
         primaryAddress = ""
         subaddresses = []
 
-        // Stop current wallet without clearing cache
-        moneroWallet?.stop()
+        // Capture old wallet so its deallocation happens off main thread
+        let oldWallet = moneroWallet
         moneroWallet = nil
         cancellables.removeAll()
+        Task.detached { [oldWallet] in let _ = oldWallet }
 
         // Reset UI state
         balance = 0
@@ -799,17 +1058,21 @@ class WalletManager: ObservableObject {
 
         // Reinitialize with new network (will use different walletId due to network suffix)
         // Note: isTestnet has already been toggled by the caller
-        do {
-            let wallet = MoneroWallet()
-            let restoreHeight = UInt64(UserDefaults.standard.integer(forKey: "\(networkPrefix)restoreHeight"))
-            let resetCount = UserDefaults.standard.integer(forKey: "\(networkPrefix)syncResetCount")
-            let resetSuffix: String? = resetCount > 0 ? "\(resetCount)" : nil
+        let walletRestoreHeight = UInt64(UserDefaults.standard.integer(forKey: "\(networkPrefix)restoreHeight"))
+        let resetCount = UserDefaults.standard.integer(forKey: "\(networkPrefix)syncResetCount")
+        let resetSuffix: String? = resetCount > 0 ? "\(resetCount)" : nil
+        let netType = networkType
 
-            try wallet.create(seed: seed, restoreHeight: restoreHeight, resetSuffix: resetSuffix, networkType: networkType)
-            moneroWallet = wallet
-            bindToWallet(wallet)
-        } catch {
-            syncState = .error("Failed to switch network: \(error.localizedDescription)")
+        // Create new wallet — Kit init runs off main via async create()
+        Task {
+            do {
+                let wallet = MoneroWallet()
+                try await wallet.create(seed: seed, restoreHeight: walletRestoreHeight, resetSuffix: resetSuffix, networkType: netType)
+                self.moneroWallet = wallet
+                self.bindToWallet(wallet)
+            } catch {
+                self.syncState = .error("Failed to switch network: \(error.localizedDescription)")
+            }
         }
     }
 }
@@ -879,5 +1142,57 @@ enum ConnectionStage: Equatable {
             return String(format: "%.1fK", Double(height) / 1_000)
         }
         return "\(height)"
+    }
+}
+
+// MARK: - URLSession Delegate for Node Reachability
+
+/// Accepts all server certificates and handles digest auth for node reachability checks.
+/// Matches the behavior of NodeManager's NWConnection latency tests,
+/// which use `sec_protocol_options_set_verify_block { _, _, complete in complete(true) }`.
+private class AllCertsTrustDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate {
+    static let shared = AllCertsTrustDelegate()
+
+    // Session-level: TLS trust
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+
+    // Task-level: HTTP digest/basic auth (monerod uses digest)
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodHTTPDigest ||
+           challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodHTTPBasic {
+            // Only attempt credentials once to avoid loops
+            guard challenge.previousFailureCount == 0 else {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
+            let isTestnet = UserDefaults.standard.bool(forKey: "isTestnet")
+            let login = UserDefaults.standard.string(forKey: isTestnet ? "selectedTestnetNodeLogin" : "selectedNodeLogin")
+            let password = UserDefaults.standard.string(forKey: isTestnet ? "selectedTestnetNodePassword" : "selectedNodePassword")
+            if let login = login, !login.isEmpty {
+                let credential = URLCredential(user: login, password: password ?? "", persistence: .forSession)
+                completionHandler(.useCredential, credential)
+            } else {
+                completionHandler(.performDefaultHandling, nil)
+            }
+        } else if let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
     }
 }

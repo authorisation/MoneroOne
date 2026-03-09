@@ -2,6 +2,7 @@ import SwiftUI
 import Charts
 
 struct PriceChartView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject var priceService: PriceService
     @EnvironmentObject var priceAlertService: PriceAlertService
     @State private var selectedTimeRange: TimeRange = .week
@@ -119,7 +120,7 @@ struct PriceChartView: View {
             }
             .refreshable {
                 await priceService.fetchPrice()
-                await priceService.fetchChartData(range: selectedTimeRange.apiRange)
+                await priceService.fetchChartData(range: selectedTimeRange.apiRange, force: true)
             }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -131,6 +132,8 @@ struct PriceChartView: View {
                     } label: {
                         Image(systemName: "bell")
                     }
+                    .accessibilityLabel("Price alerts")
+                    .accessibilityHint("View and manage price alerts")
                 }
             }
         }
@@ -169,6 +172,7 @@ struct PriceChartView: View {
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .animation(.easeInOut(duration: 0.1), value: price)
+                    .accessibilityLabel("Current Monero price, \(formatPrice(price))")
 
                 if let selectedPoint = selectedPoint {
                     // Show selected date when interacting
@@ -189,6 +193,8 @@ struct PriceChartView: View {
                             .padding(.vertical, 6)
                             .background((change >= 0 ? Color.green : Color.red).opacity(0.15))
                             .cornerRadius(8)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Price change \(selectedTimeRange.rawValue), \(change >= 0 ? "up" : "down") \(formatChartPriceChange(change))")
                         } else if priceService.isLoadingChart {
                             ProgressView()
                                 .scaleEffect(0.8)
@@ -316,12 +322,22 @@ struct PriceChartView: View {
                 .chartYScale(domain: chartYDomain)
                 .chartXSelectionIfAvailable(value: $selectedDate)
                 .frame(height: 240)
+                .accessibilityLabel("Price chart for \(selectedTimeRange.rawValue)")
+                .accessibilityHint("Shows XMR price trend over the selected time range")
             }
         }
         .frame(height: 280)
         .padding()
-        .background(Color(.secondarySystemGroupedBackground))
-        .cornerRadius(16)
+        .background {
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(.secondarySystemGroupedBackground))
+                .shadow(
+                    color: colorScheme == .light ? Color.black.opacity(0.08) : Color.clear,
+                    radius: 12,
+                    x: 0,
+                    y: 4
+                )
+        }
     }
 
     private var xAxisFormat: Date.FormatStyle {
@@ -421,6 +437,7 @@ struct PriceChartView: View {
 // MARK: - Stat Card
 
 struct StatCard: View {
+    @Environment(\.colorScheme) private var colorScheme
     let title: String
     let value: String
     let color: Color
@@ -437,8 +454,18 @@ struct StatCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding()
-        .background(Color(.tertiarySystemGroupedBackground))
-        .cornerRadius(12)
+        .background {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(.secondarySystemGroupedBackground))
+                .shadow(
+                    color: colorScheme == .light ? Color.black.opacity(0.08) : Color.clear,
+                    radius: 8,
+                    x: 0,
+                    y: 2
+                )
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title), \(value)")
     }
 }
 

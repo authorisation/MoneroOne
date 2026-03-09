@@ -19,10 +19,13 @@ struct UnlockView: View {
 
             // App Logo
             AnimatedMoneroLogo(size: 120)
+                .accessibilityHidden(true)
 
             Text("Monero One")
                 .font(.title)
                 .fontWeight(.bold)
+                .accessibilityLabel("Monero One")
+                .accessibilityAddTraits(.isHeader)
 
             // PIN Entry with dots
             VStack(spacing: 20) {
@@ -31,6 +34,7 @@ struct UnlockView: View {
                     length: preferredPINLength,
                     label: "Enter your PIN to unlock",
                     autoFocus: true,
+                    accessibilityID: "unlock.pinEntry",
                     onComplete: {
                         unlockWithPIN()
                     }
@@ -42,6 +46,9 @@ struct UnlockView: View {
                         .foregroundColor(.red)
                         .font(.caption)
                         .transition(.opacity)
+                        .accessibilityLabel(error)
+                        .accessibilityAddTraits(.isStaticText)
+                        .accessibilityIdentifier("unlock.errorMessage")
                 }
 
                 Button {
@@ -63,6 +70,9 @@ struct UnlockView: View {
                     .padding(.vertical, 12)
                 }
                 .glassButtonStyle()
+                .accessibilityLabel(isUnlocking ? "Unlocking" : "Unlock")
+                .accessibilityHint("Double tap to unlock with your PIN")
+                .accessibilityIdentifier("unlock.unlockButton")
                 .disabled(pin.count < 4 || isUnlocking)
             }
 
@@ -82,6 +92,8 @@ struct UnlockView: View {
                     .padding(.vertical, 12)
                 }
                 .glassButtonStyle()
+                .accessibilityLabel("Unlock with \(biometricAuth.biometricType.displayName)")
+                .accessibilityHint("Double tap to authenticate with \(biometricAuth.biometricType.displayName)")
                 .disabled(isUnlocking)
             }
 
@@ -93,6 +105,8 @@ struct UnlockView: View {
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }
+            .accessibilityLabel("Forgot PIN")
+            .accessibilityHint("Double tap to reset your wallet and start over")
             .padding(.top, 16)
 
             Spacer()
@@ -107,6 +121,11 @@ struct UnlockView: View {
             Text("This will delete all wallet data from this device. You can restore your wallet using your seed phrase.\n\nThis action cannot be undone.")
         }
         .onAppear {
+            // If UserDefaults was reset (reinstall/TestFlight), recover PIN length from keychain
+            if UserDefaults.standard.object(forKey: "preferredPINLength") == nil,
+               let keychainLength = KeychainStorage().getPinLength() {
+                preferredPINLength = keychainLength
+            }
             triggerBiometricsIfAvailable()
         }
         .onChange(of: scenePhase) { newPhase in
@@ -137,36 +156,36 @@ struct UnlockView: View {
         isUnlocking = true
         errorMessage = nil
 
-        do {
-            try walletManager.unlock(pin: pin)
-            // Success - ContentView will show MainTabView
-        } catch {
-            attempts += 1
-            errorMessage = "Invalid PIN"
-            pin = ""
+        Task {
+            do {
+                try await walletManager.unlock(pin: pin)
+                // Success - ContentView will show MainTabView
+            } catch {
+                attempts += 1
+                errorMessage = "Invalid PIN"
+                pin = ""
 
-            // Haptic feedback
-            let generator = UINotificationFeedbackGenerator()
-            generator.notificationOccurred(.error)
+                // Haptic feedback
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
+            isUnlocking = false
         }
-
-        isUnlocking = false
     }
 
     private func unlockWithBiometrics() {
         isUnlocking = true
         errorMessage = nil
 
-        // The keychain will prompt for Face ID/Touch ID automatically
-        do {
-            try walletManager.unlockWithBiometrics()
-            // Success
-        } catch {
-            // Biometric failed or was cancelled - user can try PIN
-            errorMessage = nil // Don't show error, just let them use PIN
+        Task {
+            do {
+                try await walletManager.unlockWithBiometrics()
+                // Success
+            } catch {
+                // Biometric failed or was cancelled - user can try PIN
+                errorMessage = nil
+            }
+            isUnlocking = false
         }
-
-        isUnlocking = false
     }
 }
 

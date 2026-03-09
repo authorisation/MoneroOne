@@ -44,6 +44,8 @@ struct TransactionDetailView: View {
                         .fontWeight(.semibold)
                         .foregroundColor(transaction.type == .incoming ? .green : .primary)
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Amount: \(transaction.type == .incoming ? "plus" : "minus") \(XMRFormatter.format(transaction.amount)) XMR")
 
                 // Fee (for outgoing)
                 if transaction.type == .outgoing {
@@ -53,27 +55,44 @@ struct TransactionDetailView: View {
                         Text("\(XMRFormatter.format(transaction.fee)) XMR")
                             .foregroundColor(.secondary)
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Fee: \(XMRFormatter.format(transaction.fee)) XMR")
                 }
 
                 // Status
                 HStack {
                     Text("Status")
                     Spacer()
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(transaction.displayStatusColor)
-                            .frame(width: 8, height: 8)
-                        Text(transaction.displayStatusText)
+                    if transaction.isStatusLoading {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                    } else {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(transaction.displayStatusColor)
+                                .frame(width: 8, height: 8)
+                                .accessibilityHidden(true)
+                            Text(transaction.displayStatusText)
+                        }
                     }
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Status: \(transaction.displayStatusText)")
 
                 // Confirmations
                 HStack {
                     Text("Confirmations")
                     Spacer()
-                    Text("\(transaction.confirmations)")
-                        .foregroundColor(.secondary)
+                    if let confirmations = transaction.confirmations {
+                        Text("\(confirmations)")
+                            .foregroundColor(.secondary)
+                    } else {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                    }
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Confirmations: \(transaction.confirmations ?? 0)")
 
                 // Memo
                 if let memo = transaction.memo, !memo.isEmpty {
@@ -93,6 +112,8 @@ struct TransactionDetailView: View {
                     Text(formattedDate)
                         .foregroundColor(.secondary)
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Date: \(formattedDate)")
 
                 // Transaction ID
                 VStack(alignment: .leading, spacing: 4) {
@@ -102,6 +123,8 @@ struct TransactionDetailView: View {
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Transaction ID: \(transaction.id)")
 
                 // For incoming: show which subaddress received the funds
                 if transaction.type == .incoming && !transaction.address.isEmpty {
@@ -119,6 +142,8 @@ struct TransactionDetailView: View {
                             .foregroundColor(.secondary)
                             .textSelection(.enabled)
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Received on \(receivingSubaddressLabel ?? "address"): \(transaction.address)")
 
                     // Privacy note about sender
                     HStack(spacing: 8) {
@@ -128,6 +153,8 @@ struct TransactionDetailView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Sender address hidden by Monero privacy")
                 }
 
                 // For outgoing: show recipient if available
@@ -139,6 +166,8 @@ struct TransactionDetailView: View {
                             .foregroundColor(.secondary)
                             .textSelection(.enabled)
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Sent to: \(transaction.address)")
                 }
             }
 
@@ -151,6 +180,8 @@ struct TransactionDetailView: View {
                         Text("Copy Transaction ID")
                     }
                 }
+                .accessibilityLabel("Copy transaction ID")
+                .accessibilityHint("Copies the transaction ID to clipboard")
 
                 if let url = blockExplorerURL {
                     Link(destination: url) {
@@ -163,6 +194,8 @@ struct TransactionDetailView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
+                    .accessibilityLabel("View in block explorer\(isTestnet ? ", testnet" : "")")
+                    .accessibilityHint("Opens the transaction in a web browser")
                 }
             }
         }

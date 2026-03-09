@@ -122,6 +122,8 @@ struct CreateWalletView: View {
                     .cornerRadius(12)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Polyseed, recommended. 16 words with embedded wallet birthday. \(selectedSeedType == .polyseed ? "Selected" : "Not selected")")
+                .accessibilityHint("Double tap to select Polyseed format")
 
                 // Standard option
                 Button {
@@ -148,6 +150,8 @@ struct CreateWalletView: View {
                     .cornerRadius(12)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Standard. 24 words, BIP39 format. Compatible with more wallets. \(selectedSeedType == .bip39 ? "Selected" : "Not selected")")
+                .accessibilityHint("Double tap to select Standard format")
             }
 
             Button {
@@ -165,6 +169,9 @@ struct CreateWalletView: View {
                 .padding(.vertical, 16)
             }
             .glassButtonStyle()
+            .accessibilityLabel("Continue")
+            .accessibilityHint("Double tap to proceed with \(selectedSeedType == .polyseed ? "Polyseed" : "Standard") seed format")
+            .accessibilityIdentifier("create.seedType.continueButton")
             .padding(.horizontal)
 
             Spacer()
@@ -204,6 +211,8 @@ struct CreateWalletView: View {
                             )
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("4 digit PIN. \(selectedPINLength == 4 ? "Selected" : "Not selected")")
+                    .accessibilityHint("Double tap to use a 4 digit PIN")
 
                     // 6 digits option (recommended)
                     Button {
@@ -234,6 +243,8 @@ struct CreateWalletView: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("6 digit PIN, recommended. \(selectedPINLength == 6 ? "Selected" : "Not selected")")
+                    .accessibilityHint("Double tap to use a 6 digit PIN")
                 }
                 .padding(.horizontal, 20)
             }
@@ -245,6 +256,7 @@ struct CreateWalletView: View {
                 label: "Enter PIN",
                 field: PINField.pin,
                 focusedField: $focusedField,
+                accessibilityID: "create.pinEntry",
                 onComplete: {
                     focusedField = .confirmPin
                 }
@@ -256,6 +268,7 @@ struct CreateWalletView: View {
                 label: "Confirm PIN",
                 field: PINField.confirmPin,
                 focusedField: $focusedField,
+                accessibilityID: "create.confirmPinEntry",
                 onComplete: {
                     if canProceed {
                         // Save the selected PIN length preference
@@ -269,6 +282,8 @@ struct CreateWalletView: View {
                 Text("PINs don't match")
                     .foregroundColor(.red)
                     .font(.caption)
+                    .accessibilityLabel("PINs don't match")
+                    .accessibilityIdentifier("create.pinMismatchError")
             }
 
             Button {
@@ -288,6 +303,9 @@ struct CreateWalletView: View {
             }
             .glassButtonStyle()
             .disabled(!canProceed)
+            .accessibilityLabel("Continue")
+            .accessibilityHint(canProceed ? "Double tap to proceed" : "Enter and confirm your PIN to continue")
+            .accessibilityIdentifier("create.pin.continueButton")
             .padding(.horizontal)
 
             Spacer()
@@ -305,9 +323,11 @@ struct CreateWalletView: View {
             Image(systemName: biometricIcon)
                 .font(.system(size: 80))
                 .foregroundColor(.orange)
+                .accessibilityHidden(true)
 
             Text("Enable \(biometricName)?")
                 .font(.title2.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
 
             Text("Unlock your wallet quickly and securely with \(biometricName) instead of entering your PIN.")
                 .font(.subheadline)
@@ -330,6 +350,8 @@ struct CreateWalletView: View {
                     .padding(.vertical, 16)
                 }
                 .glassButtonStyle()
+                .accessibilityLabel("Enable \(biometricName)")
+                .accessibilityHint("Double tap to enable \(biometricName) for quick unlock")
 
                 Button {
                     enableBiometrics = false
@@ -340,6 +362,8 @@ struct CreateWalletView: View {
                         .foregroundColor(.secondary)
                         .padding(.vertical, 12)
                 }
+                .accessibilityLabel("Skip for Now")
+                .accessibilityHint("Double tap to skip biometric setup")
             }
             .padding(.horizontal)
 
@@ -362,6 +386,9 @@ struct CreateWalletView: View {
                 .padding()
 
             Toggle("I have written down my seed phrase", isOn: $confirmed)
+                .accessibilityLabel("I have written down my seed phrase")
+                .accessibilityHint("Toggle to confirm you have saved your seed phrase")
+                .accessibilityIdentifier("create.confirmToggle")
                 .padding(.horizontal)
 
             Button {
@@ -379,6 +406,9 @@ struct CreateWalletView: View {
             }
             .glassButtonStyle()
             .disabled(!confirmed)
+            .accessibilityLabel("Continue")
+            .accessibilityHint(confirmed ? "Double tap to create your wallet" : "Confirm you have written down your seed phrase to continue")
+            .accessibilityIdentifier("create.seed.continueButton")
             .padding(.horizontal)
         }
     }
@@ -387,9 +417,11 @@ struct CreateWalletView: View {
         VStack(spacing: 24) {
             Text("Creating your wallet...")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
 
             ProgressView()
                 .scaleEffect(1.5)
+                .accessibilityLabel("Creating wallet in progress")
 
             Spacer()
         }
@@ -455,13 +487,14 @@ struct CreateWalletView: View {
                 let chainHeight = await fetchCurrentChainHeight()
 
                 try walletManager.saveWallet(mnemonic: mnemonic, pin: pin, restoreHeight: chainHeight)
+                KeychainStorage().savePinLength(selectedPINLength)
 
                 // Enable biometrics if user opted in
                 if enableBiometrics {
                     try walletManager.enableBiometricUnlock(pin: pin)
                 }
 
-                try walletManager.unlock(pin: pin)
+                try await walletManager.unlock(pin: pin)
             } catch {
                 await MainActor.run {
                     errorMessage = error.localizedDescription
